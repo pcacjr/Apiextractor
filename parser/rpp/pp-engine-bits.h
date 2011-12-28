@@ -29,6 +29,24 @@
 #include <sys/stat.h>
 #include <cstdio>
 #include <iostream>
+#include <sstream>
+#include <fstream>
+#include <string>
+#include <vector>
+
+namespace {
+
+/* Replace BOOST_PP_ITERATE_N set of macros with their respective paths */
+static const char* const boost_paths[] = {
+    "<boost/preprocessor/iteration/detail/iter/forward1.hpp>",
+    "<boost/preprocessor/iteration/detail/iter/forward2.hpp>",
+    "<boost/preprocessor/iteration/detail/iter/forward3.hpp>",
+    "<boost/preprocessor/iteration/detail/iter/forward4.hpp>",
+    "<boost/preprocessor/iteration/detail/iter/forward5.hpp>",
+    NULL,
+};
+
+}
 
 namespace rpp
 {
@@ -153,6 +171,8 @@ bool pp::find_header_protection(_InputIterator __first, _InputIterator __last, s
 inline pp::PP_DIRECTIVE_TYPE pp::find_directive(char const *__directive, std::size_t __size) const
 {
     switch (__size) {
+    case 0:
+        return PP_UNNAMED_DIRECTIVE;
     case 2:
         if (__directive[0] == 'i'
             && __directive[1] == 'f')
@@ -307,6 +327,13 @@ _InputIterator pp::handle_directive(char const *__directive, std::size_t __size,
 
     PP_DIRECTIVE_TYPE d = find_directive(__directive, __size);
     switch (d) {
+    case PP_UNNAMED_DIRECTIVE:
+        /* E.g.: boost includes in many headers the '#' character at
+         * the beginning of any line and just do nothing else with
+         * that. So we'll just ignore this for now.
+         */
+        ++__last;
+        return ++__first;
     case PP_DEFINE:
         if (! skipping())
             return handle_define(__first, __last);
@@ -358,6 +385,9 @@ _InputIterator pp::handle_include(bool __skip_current_path, _InputIterator __fir
         name.reserve(255);
         expand_include(__first, __last, std::back_inserter(name));
         std::string::iterator it = skip_blanks(name.begin(), name.end());
+        std::cout << "name: " << name << std::endl;
+        std::cout << "at " << env.current_file << ":"
+                      << env.current_line << std::endl;
         assert(it != name.end() && (*it == '<' || *it == '"'));
         handle_include(__skip_current_path, it, name.end(), __result);
         return __first;
@@ -376,6 +406,7 @@ _InputIterator pp::handle_include(bool __skip_current_path, _InputIterator __fir
     }
 
     std::string filename(__first, end_name);
+    std::cout << "FILENAME: " << filename << std::endl;
 
 #ifdef PP_OS_WIN
     std::replace(filename.begin(), filename.end(), '/', '\\');
@@ -576,10 +607,31 @@ _InputIterator pp::handle_define(_InputIterator __first, _InputIterator __last)
 
     __first = skip_blanks(__first, __last);
 
+    bool in_path = false;
     while (__first != __last && *__first != '\n') {
+        if (*__first == '<' || *__first == '"') {
+            in_path = true;
+            goto skip_path;
+        }
+
+        if (in_path) {
+            if (*__first == '>' || *__first == '"') {
+                in_path = false;
+                goto skip_path;
+            } else if (*__first == ',' || *__first == ' ' || *__first == '\\') {
+                in_path = false;
+                continue;
+            }
+        }
+
         if (*__first == '/') {
-            __first = skip_comment_or_divop(__first, __last);
-            env.current_line += skip_comment_or_divop.lines;
+            if (*(__first + 1) != '*' && *(__first + 1) != '/') {
+                in_path = true;
+                goto skip_path;
+            } else {
+                __first = skip_comment_or_divop(__first, __last);
+                env.current_line += skip_comment_or_divop.lines;
+            }
         }
 
         if (*__first == '\\') {
@@ -594,6 +646,7 @@ _InputIterator pp::handle_define(_InputIterator __first, _InputIterator __last)
             }
         }
 
+skip_path:
         definition += *__first++;
     }
 
@@ -712,12 +765,44 @@ _InputIterator pp::eval_primary(_InputIterator __first, _InputIterator __last, V
         __first = eval_constant_expression(__first, __last, result);
         next_token(__first, __last, &token);
 
-        if (token != ')')
-            std::cerr << "** WARNING expected ``)'' = " << token << std::endl;
-        else
-            __first = next_token(__first, __last, &token);
-        break;
+        if (token != ')') {
+            std::ifstream inf(env.current_file.c_str());
+            if (!inf.is_open()) {
+                std::cerr << "Could not open file " << env.current_file
+                          << std::endl;
+                goto out;
+            }
 
+            bool is_boost = false;
+            while (inf.good()) {
+                std::string line;
+                std::getline(inf, line);
+
+                if (line.empty())
+                    continue;
+
+                if (line.find("Boost") != std::string::npos) {
+                    is_boost = true;
+                    break;
+                }
+            }
+
+            inf.close();
+
+            if (is_boost) {
+                __first = next_token(__first, __last, &token);
+            } else {
+                std::cerr << "** WARNING expected ``)'' = "
+                          << token << " (at " << env.current_file
+                          << ":" << env.current_line << std::endl;
+            }
+
+        } else {
+            __first = next_token(__first, __last, &token);
+        }
+
+out:
+        break;
     default:
         result->set_long(0);
     }
